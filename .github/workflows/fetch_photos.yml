@@ -1,0 +1,112 @@
+name: Fetch Peak Atlas product photos
+
+# Reads photo_list.csv in the repository root, downloads every photo,
+# converts it to a white-background square JPG (at least 800 x 800 px),
+# saves it in the repository root under the labelled file name
+# (e.g. PA-EC-001_Pure_Lavender_Essential_Oil_10ml.jpg), commits the photos,
+# and also offers them as one zip download on the run page.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - photo_list.csv
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: pip install requests pillow pillow-avif-plugin
+
+      - name: Download and label photos
+        shell: python
+        run: |
+          import csv, io, os, time, requests
+          from PIL import Image
+          try:
+              import pillow_avif  # noqa: F401  (adds .avif support)
+          except Exception:
+              pass
+
+          UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                "Accept": "image/avif,image/webp,image/*,*/*;q=0.8"}
+          ok, skipped, failed = 0, 0, []
+          rows = list(csv.DictReader(open("photo_list.csv", encoding="utf-8")))
+          for r in rows:
+              fn, url = r["file_name"].strip(), r["source_url"].strip()
+              if os.path.exists(fn) and os.path.getsize(fn) > 5000:
+                  skipped += 1
+                  continue
+              data = None
+              for attempt in range(3):
+                  try:
+                      resp = requests.get(url, headers=UA, timeout=40)
+                      if resp.status_code == 200 and len(resp.content) > 1000:
+                          data = resp.content
+                          break
+                  except Exception as e:
+                      print("retry", fn, e)
+                  time.sleep(2)
+              if data is None:
+                  failed.append((fn, url))
+                  continue
+              try:
+                  im = Image.open(io.BytesIO(data))
+                  im.load()
+                  if im.mode in ("RGBA", "LA", "P"):
+                      im = im.convert("RGBA")
+                      bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+                      bg.alpha_composite(im)
+                      im = bg
+                  im = im.convert("RGB")
+                  side = max(im.size)
+                  canvas = Image.new("RGB", (side, side), (255, 255, 255))
+                  canvas.paste(im, ((side - im.width) // 2, (side - im.height) // 2))
+                  if side < 800:
+                      canvas = canvas.resize((800, 800), Image.LANCZOS)
+                  elif side > 1500:
+                      canvas = canvas.resize((1500, 1500), Image.LANCZOS)
+                  canvas.save(fn, "JPEG", quality=90, optimize=True)
+                  ok += 1
+              except Exception as e:
+                  failed.append((fn, f"{url}  ({e})"))
+          with open("photo_failures.txt", "w") as fh:
+              for fn, u in failed:
+                  fh.write(f"{fn}\t{u}\n")
+          print(f"Saved {ok}, already there {skipped}, failed {len(failed)} of {len(rows)}")
+          for fn, u in failed:
+              print("FAILED", fn, u)
+
+      - name: Commit photos to the repository
+        run: |
+          git config user.name "photo-bot"
+          git config user.email "photo-bot@users.noreply.github.com"
+          git add -A *.jpg photo_failures.txt || true
+          git commit -m "Add labelled product photos" || echo "Nothing new to commit"
+          git push
+
+      - name: Zip the labelled photos for download
+        run: |
+          mkdir -p Peak_Atlas_labelled_photos
+          python - <<'PY'
+          import csv, shutil, os
+          for r in csv.DictReader(open("photo_list.csv", encoding="utf-8")):
+              if os.path.exists(r["file_name"]):
+                  shutil.copy(r["file_name"], "Peak_Atlas_labelled_photos/")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Peak_Atlas_labelled_photos
+          path: Peak_Atlas_labelled_photos
